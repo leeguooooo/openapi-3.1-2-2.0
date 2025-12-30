@@ -70,9 +70,17 @@ export default {
     const log = createLogger(makeRequestId(), debug);
     log.info("request_start", request.method, requestUrl.pathname, requestUrl.search);
 
+    if (requestUrl.pathname === "/robots.txt") {
+      return respond(requestStartedAt, log, robotsResponse(requestUrl), "robots", timings, wantsTimings);
+    }
+
+    if (requestUrl.pathname === "/sitemap.xml") {
+      return respond(requestStartedAt, log, sitemapResponse(requestUrl), "sitemap", timings, wantsTimings);
+    }
+
     const sourceUrl = requestUrl.searchParams.get("url");
     if (!sourceUrl) {
-      return respond(requestStartedAt, log, usageResponse(), "usage", timings, wantsTimings);
+      return respond(requestStartedAt, log, usageResponse(requestUrl), "usage", timings, wantsTimings);
     }
 
     let parsedSource;
@@ -216,29 +224,122 @@ function corsHeaders() {
   };
 }
 
-function usageResponse() {
+function usageResponse(requestUrl) {
+  return new Response(renderLandingPage(requestUrl), {
+    status: 200,
+    headers: {
+      ...corsHeaders(),
+      "content-type": "text/html; charset=utf-8",
+      "x-robots-tag": "index, follow",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function robotsResponse(requestUrl) {
+  const origin = requestUrl.origin;
   const body = [
-    "OpenAPI 3.1 to OpenAPI 2.0 converter.",
-    "", 
-    "Usage:",
-    "  https://xxx.com/?url=https://example.com/openapi.yaml",
-    "",
-    "Optional query params:",
-    "  format=json|yaml   Output format (default: json)",
-    "  pretty=1           Pretty-print JSON output",
-    "  diagnostics=1      Include conversion notes in x-conversion-info",
-    "  timeout=15         Fetch timeout in seconds (max 30)",
-    "  debug=1            Print timing logs in worker console",
+    "User-agent: *",
+    "Allow: /",
+    `Sitemap: ${origin}/sitemap.xml`,
   ].join("\n");
 
   return new Response(body, {
     status: 200,
     headers: {
-      ...corsHeaders(),
       "content-type": "text/plain; charset=utf-8",
       "cache-control": "no-store",
     },
   });
+}
+
+function sitemapResponse(requestUrl) {
+  const origin = requestUrl.origin;
+  const body = [
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">",
+    "  <url>",
+    `    <loc>${origin}/</loc>`,
+    "    <changefreq>weekly</changefreq>",
+    "    <priority>1.0</priority>",
+    "  </url>",
+    "</urlset>",
+  ].join("\n");
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "application/xml; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function renderLandingPage(requestUrl) {
+  const origin = requestUrl ? requestUrl.origin : "https://xxx.com";
+  const canonical = requestUrl ? `${origin}${requestUrl.pathname}` : `${origin}/`;
+  const title = "OpenAPI 3.1 转 OpenAPI 2.0 在线转换器";
+  const description = "将 OpenAPI 3.1 文档快速转换为 OpenAPI 2.0 (Swagger 2.0)，支持 URL 参数一键转换。";
+  const exampleUrl = `${origin}/?url=https://example.com/openapi.json`;
+
+  return `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${title}</title>
+    <meta name="description" content="${description}" />
+    <meta name="keywords" content="OpenAPI 3.1, OpenAPI 2.0, Swagger 2.0, converter, 在线转换, API 文档" />
+    <meta name="robots" content="index,follow" />
+    <link rel="canonical" href="${canonical}" />
+    <meta property="og:title" content="${title}" />
+    <meta property="og:description" content="${description}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="${canonical}" />
+    <meta property="og:site_name" content="OpenAPI 3.1 to 2.0" />
+    <meta name="twitter:card" content="summary" />
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f7f7f7; color: #111; }
+      main { max-width: 860px; margin: 40px auto; background: #fff; padding: 32px; border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.08); }
+      h1 { margin: 0 0 12px; font-size: 28px; }
+      p { line-height: 1.6; margin: 8px 0; }
+      code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; }
+      .box { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 10px; overflow-x: auto; }
+      ul { margin: 10px 0 0 18px; }
+      footer { margin-top: 24px; font-size: 12px; color: #666; }
+    </style>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "${title}",
+        "description": "${description}",
+        "url": "${canonical}",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Any",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+      }
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>${title}</h1>
+      <p>${description}</p>
+      <p>用法示例：</p>
+      <div class="box"><code>${exampleUrl}</code></div>
+      <p>支持的查询参数：</p>
+      <ul>
+        <li><code>format=json|yaml</code> 输出格式（默认 json）</li>
+        <li><code>pretty=1</code> JSON 美化输出</li>
+        <li><code>diagnostics=1</code> 返回转换诊断信息</li>
+        <li><code>timeout=15</code> 上游拉取超时（秒，最大 30）</li>
+        <li><code>debug=1</code> 控制台打印耗时日志</li>
+      </ul>
+      <footer>Swagger 2.0 即 OpenAPI 2.0。该服务以 URL 参数方式在线转换。</footer>
+    </main>
+  </body>
+</html>`;
 }
 
 function errorResponse(status, code, message, details) {
