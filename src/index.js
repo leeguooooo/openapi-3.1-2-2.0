@@ -1,6 +1,6 @@
 import RefParserModule from "@apidevtools/json-schema-ref-parser";
 import YamlModule from "js-yaml";
-import { convertOpenapi3ToSwagger2 } from "./openapi3ToSwagger2.js";
+import { convertOpenapi3ToSwagger2, dereferenceSwagger2, sanitizeSwagger2 } from "./openapi3ToSwagger2.js";
 
 const RefParser = RefParserModule.default ?? RefParserModule;
 const Yaml = YamlModule.default ?? YamlModule;
@@ -66,6 +66,8 @@ export default {
 
     const requestUrl = new URL(request.url);
     const debug = parseBoolean(requestUrl.searchParams.get("debug"));
+    const diagnostics = parseBoolean(requestUrl.searchParams.get("diagnostics"));
+    const wantsTimings = debug || diagnostics;
     const timings = {};
     const log = createLogger(makeRequestId(), debug);
     log.info("request_start", request.method, requestUrl.pathname, requestUrl.search);
@@ -104,8 +106,8 @@ export default {
 
     const format = normalizeFormat(requestUrl.searchParams.get("format"));
     const pretty = parseBoolean(requestUrl.searchParams.get("pretty"));
-    const diagnostics = parseBoolean(requestUrl.searchParams.get("diagnostics"));
-    const wantsTimings = debug || diagnostics;
+    const strict = parseBoolean(requestUrl.searchParams.get("strict"), true);
+    const deref = parseBoolean(requestUrl.searchParams.get("deref"), true);
     const timeoutMs = clampTimeoutMs(requestUrl.searchParams.get("timeout"));
 
     let bundledSpec;
@@ -148,8 +150,10 @@ export default {
     }
 
     if (bundledSpec.swagger === "2.0") {
+      const sanitized = sanitizeSwagger2(bundledSpec, { strict, log, debug });
+      const dereferenced = deref ? dereferenceSwagger2(sanitized, { log, debug }) : sanitized;
       const renderStartedAt = Date.now();
-      const response = renderSpec(bundledSpec, {
+      const response = renderSpec(finalizeSwaggerSpec(dereferenced), {
         format,
         pretty,
         diagnostics,
@@ -182,7 +186,7 @@ export default {
     try {
       const convertStartedAt = Date.now();
       log.debug("convert_start");
-      swaggerSpec = convertOpenapi3ToSwagger2(normalized, { log, debug });
+      swaggerSpec = convertOpenapi3ToSwagger2(normalized, { log, debug, strict });
       timings.convertMs = Date.now() - convertStartedAt;
       log.debug("convert_done", `${Date.now() - convertStartedAt}ms`);
     } catch (error) {
@@ -198,7 +202,8 @@ export default {
         )
       );
     }
-    const finalizedSpec = finalizeSwaggerSpec(swaggerSpec);
+    const dereferenced = deref ? dereferenceSwagger2(swaggerSpec, { log, debug }) : swaggerSpec;
+    const finalizedSpec = finalizeSwaggerSpec(dereferenced);
 
     const renderStartedAt = Date.now();
     const response = renderSpec(finalizedSpec, {
@@ -334,6 +339,8 @@ function renderLandingPage(requestUrl) {
         <li><code>pretty=1</code> JSON 美化输出</li>
         <li><code>diagnostics=1</code> 返回转换诊断信息</li>
         <li><code>timeout=15</code> 上游拉取超时（秒，最大 30）</li>
+        <li><code>strict=0</code> 保留扩展字段（默认严格 Swagger 2.0）</li>
+        <li><code>deref=0</code> 保留 $ref 引用（默认内联）</li>
         <li><code>debug=1</code> 控制台打印耗时日志</li>
       </ul>
       <footer>Swagger 2.0 即 OpenAPI 2.0。该服务以 URL 参数方式在线转换。</footer>
@@ -364,8 +371,8 @@ function normalizeFormat(value) {
   return normalized === "yaml" ? "yaml" : "json";
 }
 
-function parseBoolean(value) {
-  if (!value) return false;
+function parseBoolean(value, fallback = false) {
+  if (!value) return fallback;
   return value === "1" || value.toLowerCase() === "true";
 }
 

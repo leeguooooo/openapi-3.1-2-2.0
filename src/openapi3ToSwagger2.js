@@ -19,6 +19,37 @@ const SCHEMA_PROPERTIES = [
   "default",
 ];
 const ARRAY_PROPERTIES = ["type", "items"];
+const STRICT_SCHEMA_REMOVE_KEYS = new Set([
+  "$schema",
+  "$id",
+  "anchor",
+  "defs",
+  "$defs",
+  "if",
+  "then",
+  "else",
+  "dependentSchemas",
+  "dependentRequired",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+  "propertyNames",
+  "patternProperties",
+  "contains",
+  "minContains",
+  "maxContains",
+  "prefixItems",
+  "contentEncoding",
+  "contentMediaType",
+  "contentSchema",
+  "const",
+  "nullable",
+  "oneOf",
+  "anyOf",
+  "not",
+  "deprecated",
+  "writeOnly",
+  "examples",
+]);
 
 const APPLICATION_JSON_REGEX = /^(application\/json|[^;\/ \t]+\/[^;\/ \t]+[+]json)[ \t]*(;.*)?$/;
 const SUPPORTED_MIME_TYPES = {
@@ -37,6 +68,7 @@ class Converter {
     this.spec = spec;
     this.log = options && options.log;
     this.debug = Boolean(options && options.debug);
+    this.strict = options && options.strict !== undefined ? Boolean(options.strict) : true;
     this.trace = this.debug ? { schemaCount: 0 } : null;
   }
 
@@ -65,6 +97,9 @@ class Converter {
       delete this.spec.components;
 
       fixRefs(this.spec);
+    }
+    if (this.strict) {
+      sanitizeSwagger2(this.spec, { log: this.log, debug: this.debug });
     }
     this.logDebug("convert_total_done", `${Date.now() - totalStartedAt}ms`);
     return this.spec;
@@ -567,4 +602,349 @@ function parseServerUrl(serverUrl) {
     scheme: null,
     pathname: serverUrl,
   };
+}
+
+export function sanitizeSwagger2(spec, options = {}) {
+  const strict = options && options.strict !== undefined ? Boolean(options.strict) : true;
+  if (!strict || !spec || typeof spec !== "object") return spec;
+
+  const log = options && options.log;
+  const debug = Boolean(options && options.debug);
+  const stripExtensions = options && options.stripExtensions !== undefined ? Boolean(options.stripExtensions) : true;
+  let flattenedAllOf = 0;
+  let removedKeys = 0;
+  let removedExtensions = 0;
+  const mapContainerKeys = new Set([
+    "paths",
+    "definitions",
+    "parameters",
+    "responses",
+    "securityDefinitions",
+    "headers",
+    "callbacks",
+    "schemas",
+    "requestBodies",
+    "components",
+    "properties",
+    "examples",
+  ]);
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    const flattenState = { active: new WeakSet() };
+    const seen = new WeakSet();
+    const stack = [{ node: spec, mode: "normal" }];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      const node = current && current.node;
+      const mode = current && current.mode;
+      if (!node || typeof node !== "object") continue;
+      if (seen.has(node)) continue;
+      seen.add(node);
+
+      if (Array.isArray(node)) {
+        node.forEach((item) => stack.push({ node: item, mode: "normal" }));
+        continue;
+      }
+
+      if (mode === "normal") {
+        if (stripExtensions) {
+          for (const key in node) {
+            if (key.startsWith("x-")) {
+              delete node[key];
+              removedExtensions += 1;
+            }
+          }
+        }
+
+        const schemaLike = isSchemaLike(node);
+        if (node.example !== undefined) {
+          delete node.example;
+          removedKeys += 1;
+        }
+        if (node.examples !== undefined) {
+          delete node.examples;
+          removedKeys += 1;
+        }
+        if (schemaLike && node.allOf && Array.isArray(node.allOf)) {
+          if (flattenAllOf(node, spec, flattenState)) {
+            flattenedAllOf += 1;
+          }
+        }
+
+        if (schemaLike) {
+          if (node.$ref && typeof node.$ref === "string" && node.$ref.includes("/allOf/")) {
+            const rewritten = rewriteAllOfRef(node.$ref, spec);
+            if (rewritten) {
+              node.$ref = rewritten;
+            }
+          }
+          for (const key in node) {
+            if (STRICT_SCHEMA_REMOVE_KEYS.has(key)) {
+              delete node[key];
+              removedKeys += 1;
+              continue;
+            }
+            if (key === "additionalProperties") {
+              const value = node[key];
+              if (value === true || value === false) {
+                delete node[key];
+                removedKeys += 1;
+              }
+            }
+          }
+          ensureSchemaType(node);
+        }
+      }
+
+      for (const key in node) {
+        const childMode = mapContainerKeys.has(key) ? "map" : "normal";
+        stack.push({ node: node[key], mode: childMode });
+      }
+    }
+  }
+
+  if (debug && log && typeof log.debug === "function") {
+    const parts = [];
+    if (flattenedAllOf) parts.push(`allOf=${flattenedAllOf}`);
+    if (removedKeys) parts.push(`removed=${removedKeys}`);
+    if (removedExtensions) parts.push(`x=${removedExtensions}`);
+    if (parts.length) {
+      log.debug("sanitize_done", parts.join(" "));
+    }
+  }
+  return spec;
+}
+
+export function dereferenceSwagger2(spec, options = {}) {
+  if (!spec || typeof spec !== "object") return spec;
+  const log = options && options.log;
+  const debug = Boolean(options && options.debug);
+  const dropDefinitions = options && options.dropDefinitions !== undefined ? Boolean(options.dropDefinitions) : true;
+  const cache = new Map();
+  const resolving = new Set();
+  let replacedRefs = 0;
+  let missingRefs = 0;
+  let cycleRefs = 0;
+
+  const derefNode = (node) => {
+    if (!node || typeof node !== "object") return node;
+    if (Array.isArray(node)) {
+      return node.map((item) => derefNode(item));
+    }
+
+    if (node.$ref && typeof node.$ref === "string") {
+      const ref = node.$ref;
+      const resolved = derefRef(ref);
+      if (!resolved) {
+        missingRefs += 1;
+        const fallback = node.description ? { description: node.description } : {};
+        if (!fallback.type) fallback.type = "object";
+        return fallback;
+      }
+      const merged = resolved;
+      for (const key in node) {
+        if (key === "$ref") continue;
+        merged[key] = node[key];
+      }
+      replacedRefs += 1;
+      return derefNode(merged);
+    }
+
+    for (const key in node) {
+      node[key] = derefNode(node[key]);
+    }
+    return node;
+  };
+
+  const derefRef = (ref) => {
+    if (!ref.startsWith("#/")) return null;
+    if (cache.has(ref)) return deepClone(cache.get(ref));
+    if (resolving.has(ref)) {
+      cycleRefs += 1;
+      return null;
+    }
+    const target = resolveRef(spec, ref);
+    if (!target || typeof target !== "object") {
+      return null;
+    }
+    resolving.add(ref);
+    const clone = deepClone(target);
+    const resolved = derefNode(clone);
+    cache.set(ref, resolved);
+    resolving.delete(ref);
+    return deepClone(resolved);
+  };
+
+  derefNode(spec);
+
+  if (dropDefinitions) {
+    delete spec.definitions;
+    delete spec.parameters;
+    delete spec.responses;
+  }
+
+  if (debug && log && typeof log.debug === "function") {
+    const parts = [
+      `refs=${replacedRefs}`,
+      missingRefs ? `missing=${missingRefs}` : null,
+      cycleRefs ? `cycles=${cycleRefs}` : null,
+    ].filter(Boolean);
+    log.debug("deref_done", parts.join(" "));
+  }
+
+  return spec;
+}
+
+function flattenAllOf(schema, root, state) {
+  if (!schema || !Array.isArray(schema.allOf) || schema.allOf.length === 0) return false;
+  if (state && state.active && state.active.has(schema)) return false;
+  if (state && state.active) {
+    state.active.add(schema);
+  }
+
+  const resolvedItems = [];
+  for (const item of schema.allOf) {
+    if (!item || typeof item !== "object") {
+      if (state && state.active) state.active.delete(schema);
+      return false;
+    }
+    if (item.$ref) {
+      let resolved = resolveRef(root, item.$ref);
+      if (!resolved && typeof item.$ref === "string" && item.$ref.includes("/allOf/")) {
+        const candidate = item.$ref.replace(/\/allOf\/\d+/g, "");
+        resolved = resolveRef(root, candidate);
+        if (resolved) {
+          item.$ref = candidate;
+        }
+      }
+      if (!resolved || typeof resolved !== "object") {
+        if (state && state.active) state.active.delete(schema);
+        return false;
+      }
+      resolvedItems.push(resolved);
+    } else {
+      resolvedItems.push(item);
+    }
+  }
+
+  const merged = {};
+  mergeSchema(merged, schema);
+  for (const item of resolvedItems) {
+    if (item.allOf) {
+      flattenAllOf(item, root, state);
+    }
+    mergeSchema(merged, item);
+  }
+
+  for (const key in schema) {
+    delete schema[key];
+  }
+  Object.assign(schema, merged);
+  ensureSchemaType(schema);
+
+  if (state && state.active) {
+    state.active.delete(schema);
+  }
+  return true;
+}
+
+function mergeSchema(target, source) {
+  if (!source || typeof source !== "object") return;
+  for (const key in source) {
+    if (key === "allOf") continue;
+    const value = source[key];
+    if (key === "properties" && value && typeof value === "object") {
+      target.properties = target.properties || {};
+      Object.assign(target.properties, value);
+      continue;
+    }
+    if (key === "required" && Array.isArray(value)) {
+      const current = Array.isArray(target.required) ? target.required : [];
+      const merged = new Set(current);
+      value.forEach((entry) => merged.add(entry));
+      target.required = Array.from(merged);
+      continue;
+    }
+    if (key === "type") {
+      if (!target.type && value) {
+        target.type = value;
+      }
+      continue;
+    }
+    if (key === "items" && value !== undefined) {
+      if (!target.items) {
+        target.items = value;
+      }
+      continue;
+    }
+    if (key === "additionalProperties" && value !== undefined) {
+      if (target.additionalProperties === undefined) {
+        target.additionalProperties = value;
+      }
+      continue;
+    }
+    if (key === "description") {
+      if (!target.description && value) {
+        target.description = value;
+      }
+      continue;
+    }
+    if (!Object.prototype.hasOwnProperty.call(target, key)) {
+      target[key] = value;
+    }
+  }
+}
+
+function resolveRef(root, ref) {
+  if (!root || typeof root !== "object") return null;
+  if (!ref || typeof ref !== "string") return null;
+  if (!ref.startsWith("#/")) return null;
+  const parts = ref
+    .slice(2)
+    .split("/")
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let current = root;
+  for (const part of parts) {
+    if (!current || typeof current !== "object") return null;
+    current = current[part];
+  }
+  return current || null;
+}
+
+function isSchemaLike(value) {
+  if (!value || typeof value !== "object") return false;
+  return (
+    value.$ref ||
+    value.type ||
+    value.format ||
+    value.properties ||
+    value.items ||
+    value.allOf ||
+    value.anyOf ||
+    value.oneOf ||
+    value.additionalProperties ||
+    value.enum ||
+    value.discriminator
+  );
+}
+
+function ensureSchemaType(schema) {
+  if (!schema || typeof schema !== "object") return;
+  if (schema.$ref) return;
+  if (!schema.type) {
+    if (schema.properties || schema.additionalProperties || schema.required) {
+      schema.type = "object";
+    } else if (schema.items) {
+      schema.type = "array";
+    }
+  }
+}
+
+function rewriteAllOfRef(ref, root) {
+  if (!ref || typeof ref !== "string") return null;
+  if (!ref.startsWith("#/") || ref.indexOf("/allOf/") === -1) return null;
+  const candidate = ref.replace(/\/allOf\/\d+/g, "");
+  if (candidate === ref) return null;
+  if (resolveRef(root, candidate)) return candidate;
+  return null;
 }
